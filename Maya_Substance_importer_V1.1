@@ -1,0 +1,707 @@
+"""
+╔══════════════════════════════════════════════════════════════╗
+║       Substance Painter  ->  Maya Arnold Importer            ║
+╠══════════════════════════════════════════════════════════════╣
+║  Author  : EL MENDILI Mouad                                  ║
+║  GitHub  : github.com/moadmaxe/Maya_Substance_importer       ║
+║  Support : ko-fi.com/elmendili                               ║
+║  License : MIT                                               ║
+╠══════════════════════════════════════════════════════════════╣
+║  - Auto-detects ACES, sRGB, and any custom colour config     ║
+║  - Smart UDIM detection (single-tile vs real UDIM sequence)  ║
+║  - Reads existing material names — no renaming required      ║
+║  - Supports multi-material (per-face) objects                ║
+║  - Preserves all face material assignments                   ║
+║  - Advanced options for power users                          ║
+╠══════════════════════════════════════════════════════════════╣
+║  MIT License                                                 ║
+║  Copyright (c) 2025 EL MENDILI Mouad                         ║
+║                                                              ║
+║  Permission is hereby granted, free of charge, to any       ║
+║  person obtaining a copy of this software to deal in it      ║
+║  without restriction, including without limitation the       ║
+║  rights to use, copy, modify, merge, publish, distribute,    ║
+║  sublicense, and/or sell copies of the Software, and to      ║
+║  permit persons to whom the Software is furnished to do so.  ║
+║                                                              ║
+║  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF       ║
+║  ANY KIND. IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR       ║
+║  ANY CLAIM, DAMAGES OR OTHER LIABILITY.                      ║
+╠══════════════════════════════════════════════════════════════╣
+║  HOW TO USE                                                  ║
+║  1. Paste this script into Maya Script Editor (Python tab)   ║
+║  2. Run it — a UI window will open                           ║
+║  3. Select your objects in the viewport                      ║
+║  4. Browse to your Substance Painter texture export folder   ║
+║  5. Click "Apply to Selected Objects"                        ║
+║                                                              ║
+║  Save as a shelf button for quick access:                    ║
+║    import substance_importer; substance_importer.run()       ║
+╚══════════════════════════════════════════════════════════════╝
+"""
+
+import os
+import re
+import maya.cmds as cmds
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  COLOUR SPACE  — auto-detects ACES / sRGB / any custom config
+# ═══════════════════════════════════════════════════════════════════
+
+def _find_color_space(candidates, available):
+    avail_lower = {cs.lower(): cs for cs in available}
+    for c in candidates:
+        if c.lower() in avail_lower:
+            return avail_lower[c.lower()]
+    return None
+
+def resolve_color_spaces():
+    try:
+        available = cmds.colorManagementPrefs(query=True, inputSpaceNames=True) or []
+    except Exception:
+        available = []
+
+    color_cs = _find_color_space([
+        'ACES - ACEScg', 'ACEScg',
+        'Input - Generic - sRGB - Texture', 'Utility - sRGB - Texture',
+        'sRGB (texture)', 'sRGB', 'Input - sRGB', 'sRGB_tx',
+    ], available)
+
+    raw_cs = _find_color_space([
+        'Utility - Raw', 'Raw', 'raw',
+        'Utility - Linear - sRGB', 'scene-linear Rec.709-sRGB',
+        'Linear', 'linear', 'Non-Color',
+    ], available)
+
+    if not color_cs:
+        try:
+            color_cs = cmds.colorManagementPrefs(query=True, renderingSpaceName=True)
+        except Exception:
+            color_cs = 'sRGB'
+    if not raw_cs:
+        raw_cs = color_cs
+
+    print("  [colorMgmt] color='{}' raw='{}'".format(color_cs, raw_cs))
+    return color_cs, raw_cs
+
+_COLOR_CS = None
+_RAW_CS   = None
+
+def get_color_cs():
+    global _COLOR_CS, _RAW_CS
+    if _COLOR_CS is None:
+        _COLOR_CS, _RAW_CS = resolve_color_spaces()
+    return _COLOR_CS
+
+def get_raw_cs():
+    global _COLOR_CS, _RAW_CS
+    if _RAW_CS is None:
+        _COLOR_CS, _RAW_CS = resolve_color_spaces()
+    return _RAW_CS
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  MAP DETECTION
+# ═══════════════════════════════════════════════════════════════════
+
+MAP_KEYWORDS = {
+    'color':     ['basecolor'],
+    'metallic':  ['metallic'],
+    'roughness': ['roughness'],
+    'normal':    ['normal'],
+    'height':    ['height'],
+    'ao':        ['ambientocclusion', 'ao'],
+    'emissive':  ['emissive', 'emission'],
+    'opacity':   ['opacity'],
+}
+
+MAP_SUFFIXES = [
+    '_BaseColor', '_Metallic', '_Roughness', '_Normal',
+    '_Height', '_AmbientOcclusion', '_Emissive', '_Opacity',
+]
+
+def to_udim_path(path):
+    return re.sub(r'\.(1\d{3})(?=\.\w+$)', '.<UDIM>', path)
+
+def tile_base_key(filename):
+    return re.sub(r'\.(1\d{3})(?=\.\w+$)', '.TILE', filename)
+
+def extract_texture_set_name(filename):
+    name = os.path.splitext(os.path.basename(filename))[0]
+    name = re.sub(r'\.(1\d{3})$', '', name)
+    for suffix in sorted(MAP_SUFFIXES, key=len, reverse=True):
+        idx = name.lower().find(suffix.lower())
+        if idx != -1:
+            name = name[:idx]
+            break
+    return name.rstrip('_- ')
+
+def detect_map_type(filename):
+    lower = filename.lower()
+    for map_type, keywords in MAP_KEYWORDS.items():
+        for kw in keywords:
+            if kw in lower:
+                return map_type
+    return None
+
+def build_texture_map(folder):
+    """Returns: texture_set_name -> { map_type: (full_path, is_udim) }"""
+    result = {}
+    try:
+        entries = [f for f in os.listdir(folder)
+                   if os.path.isfile(os.path.join(folder, f)) and not f.endswith('.tx')]
+    except Exception as e:
+        cmds.warning("Cannot list folder: {}".format(e))
+        return result
+
+    tile_counts = {}
+    for fname in entries:
+        key = tile_base_key(fname)
+        tile_counts[key] = tile_counts.get(key, 0) + 1
+
+    for fname in entries:
+        full_path = os.path.join(folder, fname)
+        map_type  = detect_map_type(fname)
+        if not map_type:
+            continue
+        ts_name = extract_texture_set_name(fname)
+        if not ts_name:
+            continue
+        if ts_name not in result:
+            result[ts_name] = {}
+        if map_type not in result[ts_name]:
+            use_udim = tile_counts.get(tile_base_key(fname), 1) > 1
+            result[ts_name][map_type] = (full_path, use_udim)
+    return result
+
+def find_texture_set(material_name, texture_map, prefix=''):
+    """
+    Match a material name to a texture set.
+    Strips optional prefix from texture set names before comparing
+    (e.g. prefix='BUZZ_3_' lets 'graaaays' match 'BUZZ_3_graaaays').
+    Uses substring matching, prefers longest match.
+    """
+    mat_lower = material_name.lower()
+    best = None
+    best_len = 0
+    for ts in texture_map:
+        ts_check = ts.lower()
+        if prefix and ts_check.startswith(prefix.lower()):
+            ts_check = ts_check[len(prefix):]
+        if mat_lower in ts_check or ts_check in mat_lower:
+            score = len(mat_lower) if mat_lower in ts_check else len(ts_check)
+            if score > best_len:
+                best_len = score
+                best = ts
+    return best
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  MAYA HELPERS
+# ═══════════════════════════════════════════════════════════════════
+
+def get_materials_on_object(obj):
+    pairs = []
+    shapes = cmds.listRelatives(obj, shapes=True, fullPath=True) or []
+    for shape in shapes:
+        sgs  = cmds.listConnections(shape, type='shadingEngine') or []
+        seen = set()
+        for sg in sgs:
+            if sg in seen:
+                continue
+            seen.add(sg)
+            for shader in (cmds.listConnections(sg + '.surfaceShader') or []):
+                pairs.append((shader, sg))
+    return pairs
+
+def make_file_node(file_path, color_space, use_udim=False, name_hint=''):
+    node = cmds.shadingNode('file', asTexture=True, isColorManaged=True)
+    if name_hint:
+        try:
+            node = cmds.rename(node, name_hint + '_file')
+        except Exception:
+            pass
+    if use_udim:
+        cmds.setAttr(node + '.fileTextureName', to_udim_path(file_path), type='string')
+        cmds.setAttr(node + '.uvTilingMode', 1)
+    else:
+        cmds.setAttr(node + '.fileTextureName', file_path, type='string')
+        cmds.setAttr(node + '.uvTilingMode', 0)
+    try:
+        cmds.setAttr(node + '.colorSpace', color_space, type='string')
+        cmds.setAttr(node + '.ignoreColorSpaceFileRules', 1)
+    except Exception as e:
+        cmds.warning("    color space '{}' failed: {}".format(color_space, e))
+    return node
+
+def replace_shader_on_sg(sg, new_shader):
+    for old in (cmds.listConnections(sg + '.surfaceShader') or []):
+        if cmds.isConnected(old + '.outColor', sg + '.surfaceShader'):
+            cmds.disconnectAttr(old + '.outColor', sg + '.surfaceShader')
+    cmds.connectAttr(new_shader + '.outColor', sg + '.surfaceShader', force=True)
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  MAP CONNECTIONS
+# ═══════════════════════════════════════════════════════════════════
+
+def connect_maps(shader, maps, opts):
+    """
+    opts keys:
+      enabled_maps  : set of map_type strings to connect
+      normal_method : 'aiNormalMap' or 'bump2d'
+      bump_depth    : float
+      emission_mult : float
+    """
+    color_cs = get_color_cs()
+    raw_cs   = get_raw_cs()
+    enabled  = opts.get('enabled_maps', set(MAP_KEYWORDS.keys()))
+
+    for map_type, (file_path, udim) in maps.items():
+        if map_type not in enabled:
+            continue
+        cs = color_cs if map_type in ('color', 'emissive') else raw_cs
+
+        if map_type == 'color':
+            fn = make_file_node(file_path, cs, udim, shader + '_color')
+            try:
+                cmds.connectAttr(fn + '.outColor', shader + '.baseColor', force=True)
+                print("    [OK] color ({})  ->  baseColor".format(cs))
+            except Exception as e:
+                cmds.warning("    color failed: {}".format(e))
+
+        elif map_type == 'metallic':
+            fn = make_file_node(file_path, raw_cs, udim, shader + '_metallic')
+            cmds.setAttr(fn + '.alphaIsLuminance', 1)
+            try:
+                cmds.connectAttr(fn + '.outColorR', shader + '.metalness', force=True)
+                print("    [OK] metallic  ->  metalness")
+            except Exception as e:
+                cmds.warning("    metallic failed: {}".format(e))
+
+        elif map_type == 'roughness':
+            fn = make_file_node(file_path, raw_cs, udim, shader + '_roughness')
+            cmds.setAttr(fn + '.alphaIsLuminance', 1)
+            try:
+                cmds.connectAttr(fn + '.outColorR', shader + '.specularRoughness', force=True)
+                print("    [OK] roughness  ->  specularRoughness")
+            except Exception as e:
+                cmds.warning("    roughness failed: {}".format(e))
+
+        elif map_type == 'normal':
+            fn = make_file_node(file_path, raw_cs, udim, shader + '_normal')
+            connected = False
+            method = opts.get('normal_method', 'aiNormalMap')
+            if method == 'aiNormalMap' and cmds.pluginInfo('mtoa', query=True, loaded=True):
+                try:
+                    ai_nm = cmds.shadingNode('aiNormalMap', asUtility=True,
+                                             name=shader + '_normalMap')
+                    cmds.connectAttr(fn + '.outColor',    ai_nm + '.input',        force=True)
+                    cmds.connectAttr(ai_nm + '.outValue', shader + '.normalCamera', force=True)
+                    print("    [OK] normal  ->  normalCamera (aiNormalMap)")
+                    connected = True
+                except Exception:
+                    pass
+            if not connected:
+                try:
+                    bump = cmds.shadingNode('bump2d', asUtility=True, name=shader + '_bump')
+                    cmds.setAttr(bump + '.bumpType', 1)
+                    cmds.setAttr(bump + '.bumpDepth', 1.0)
+                    cmds.connectAttr(fn + '.outColorR',   bump + '.bumpValue',      force=True)
+                    cmds.connectAttr(bump + '.outNormal', shader + '.normalCamera', force=True)
+                    print("    [OK] normal  ->  normalCamera (bump2d fallback)")
+                except Exception as e:
+                    cmds.warning("    normal failed: {}".format(e))
+
+        elif map_type == 'height':
+            fn = make_file_node(file_path, raw_cs, udim, shader + '_height')
+            cmds.setAttr(fn + '.alphaIsLuminance', 1)
+            try:
+                bump = cmds.shadingNode('bump2d', asUtility=True, name=shader + '_heightBump')
+                cmds.setAttr(bump + '.bumpType', 0)
+                cmds.setAttr(bump + '.bumpDepth', opts.get('bump_depth', 0.1))
+                cmds.connectAttr(fn + '.outColorR', bump + '.bumpValue', force=True)
+                if not cmds.listConnections(shader + '.normalCamera'):
+                    cmds.connectAttr(bump + '.outNormal', shader + '.normalCamera', force=True)
+                    print("    [OK] height  ->  normalCamera (bump2d)")
+                else:
+                    print("    [--] height: node created, normalCamera taken by normal map")
+            except Exception as e:
+                cmds.warning("    height failed: {}".format(e))
+
+        elif map_type == 'ao':
+            make_file_node(file_path, raw_cs, udim, shader + '_ao')
+            print("    [--] ao  ->  node created (not auto-connected, use manually)")
+
+        elif map_type == 'emissive':
+            fn = make_file_node(file_path, color_cs, udim, shader + '_emissive')
+            try:
+                cmds.connectAttr(fn + '.outColor', shader + '.emissionColor', force=True)
+                cmds.setAttr(shader + '.emission', opts.get('emission_mult', 1.0))
+                print("    [OK] emissive  ->  emissionColor")
+            except Exception as e:
+                cmds.warning("    emissive failed: {}".format(e))
+
+        elif map_type == 'opacity':
+            fn = make_file_node(file_path, raw_cs, udim, shader + '_opacity')
+            cmds.setAttr(fn + '.alphaIsLuminance', 1)
+            try:
+                cmds.connectAttr(fn + '.outColorR', shader + '.opacity', force=True)
+                print("    [OK] opacity  ->  opacity")
+            except Exception as e:
+                cmds.warning("    opacity failed: {}".format(e))
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  UI
+# ═══════════════════════════════════════════════════════════════════
+
+class SubstanceImporterUI(object):
+
+    VERSION = '1.1'
+
+    def __init__(self):
+        self.win    = 'substanceImporterWin'
+        self.folder = ''
+        # control references
+        self._folder_field = None
+        self._cb_color     = None
+        self._cb_metallic  = None
+        self._cb_roughness = None
+        self._cb_normal    = None
+        self._cb_height    = None
+        self._cb_ao        = None
+        self._cb_emissive  = None
+        self._cb_opacity   = None
+        self._rb_ainormal  = None
+        self._rb_bump2d    = None
+        self._fld_prefix   = None
+        self._fld_bump     = None
+        self._fld_emission = None
+        self._cb_overwrite = None
+
+    def show(self):
+        if cmds.window(self.win, exists=True):
+            cmds.deleteUI(self.win)
+
+        cmds.window(self.win,
+                    title='Substance Painter -> Arnold Importer  v{}'.format(self.VERSION),
+                    widthHeight=(500, 480),
+                    sizeable=True,
+                    resizeToFitChildren=False)
+
+        cmds.scrollLayout('mainScroll',
+                          horizontalScrollBarThickness=0,
+                          verticalScrollBarThickness=14,
+                          childResizable=True)
+        main = cmds.columnLayout(adjustableColumn=True, rowSpacing=0)
+
+        # ── TITLE ─────────────────────────────────────────────────
+        cmds.separator(height=10, style='none')
+        cmds.text(label='Substance Painter  to  Arnold Importer',
+                  font='boldLabelFont', align='center', height=22)
+        cmds.text(label='v{}  |  Supports ACES & sRGB  |  UDIM  |  Multi-material objects'.format(self.VERSION),
+                  font='smallPlainLabelFont', align='center', height=18)
+        cmds.separator(height=10, style='none')
+        cmds.separator(height=1,  style='in')
+        cmds.separator(height=8,  style='none')
+
+        # ── STEP 1 ────────────────────────────────────────────────
+        cmds.text(label='Step 1  —  Select objects in the viewport',
+                  font='boldLabelFont', align='left', height=20)
+        cmds.text(label='    Select all the meshes you want to apply textures to.',
+                  font='smallPlainLabelFont', align='left', height=18)
+
+        cmds.separator(height=10, style='none')
+
+        # ── STEP 2 ────────────────────────────────────────────────
+        cmds.text(label='Step 2  —  Choose your texture folder',
+                  font='boldLabelFont', align='left', height=20)
+        cmds.text(label='    Point to the folder where Substance exported your textures.',
+                  font='smallPlainLabelFont', align='left', height=18)
+        cmds.separator(height=6, style='none')
+
+        cmds.rowLayout(numberOfColumns=2,
+                       adjustableColumn=1,
+                       columnWidth=[(2, 90)],
+                       columnAttach=[(1,'both',12),(2,'right',12)])
+        self._folder_field = cmds.textField(
+            editable=False,
+            text='No folder selected',
+            font='smallFixedWidthFont',
+            backgroundColor=(0.2, 0.2, 0.2),
+            height=28)
+        cmds.button(label='Browse...', height=28, width=84, command=self._browse)
+        cmds.setParent('..')
+
+        cmds.separator(height=12, style='none')
+        cmds.separator(height=1,  style='in')
+        cmds.separator(height=8,  style='none')
+
+        # ── STEP 3  —  APPLY ──────────────────────────────────────
+        cmds.text(label='Step 3  —  Apply',
+                  font='boldLabelFont', align='left', height=20)
+        cmds.separator(height=6, style='none')
+        cmds.rowLayout(numberOfColumns=1,
+                       columnAttach=[(1,'both',12)])
+        cmds.button(label='Apply to Selected Objects',
+                    height=50,
+                    backgroundColor=(0.15, 0.38, 0.15),
+                    command=self._apply)
+        cmds.setParent('..')
+
+        cmds.separator(height=12, style='none')
+        cmds.separator(height=1,  style='in')
+        cmds.separator(height=8,  style='none')
+
+        # ── ADVANCED OPTIONS ──────────────────────────────────────
+        cmds.frameLayout('advFrame',
+                         label='  Advanced Options',
+                         collapsable=True,
+                         collapse=True,
+                         borderStyle='etchedIn',
+                         marginHeight=10)
+        cmds.columnLayout(adjustableColumn=True, rowSpacing=0)
+
+        # Maps
+        cmds.text(label='Maps to connect', font='boldLabelFont',
+                  align='left', height=22)
+        cmds.text(label='Uncheck any map you want to skip.',
+                  font='smallPlainLabelFont', align='left', height=18)
+        cmds.separator(height=6, style='none')
+
+        cmds.rowLayout(numberOfColumns=4,
+                       columnWidth=[(1,110),(2,110),(3,110),(4,110)],
+                       columnAttach=[(1,'left',0),(2,'left',0),(3,'left',0),(4,'left',0)])
+        self._cb_color     = cmds.checkBox(label='Base Color',  value=True, height=24)
+        self._cb_metallic  = cmds.checkBox(label='Metallic',    value=True, height=24)
+        self._cb_roughness = cmds.checkBox(label='Roughness',   value=True, height=24)
+        self._cb_normal    = cmds.checkBox(label='Normal',      value=True, height=24)
+        cmds.setParent('..')
+        cmds.rowLayout(numberOfColumns=4,
+                       columnWidth=[(1,110),(2,110),(3,110),(4,110)],
+                       columnAttach=[(1,'left',0),(2,'left',0),(3,'left',0),(4,'left',0)])
+        self._cb_height    = cmds.checkBox(label='Height',      value=True, height=24)
+        self._cb_ao        = cmds.checkBox(label='AO',          value=True, height=24)
+        self._cb_emissive  = cmds.checkBox(label='Emissive',    value=True, height=24)
+        self._cb_opacity   = cmds.checkBox(label='Opacity',     value=True, height=24)
+        cmds.setParent('..')
+
+        cmds.separator(height=14, style='in')
+
+        # Normal method
+        cmds.text(label='Normal map method', font='boldLabelFont',
+                  align='left', height=22)
+        cmds.text(label='aiNormalMap is recommended if you use Arnold. Use bump2d for other renderers.',
+                  font='smallPlainLabelFont', align='left', height=18, wordWrap=True)
+        cmds.separator(height=6, style='none')
+        coll = cmds.radioCollection()
+        cmds.rowLayout(numberOfColumns=2,
+                       columnWidth=[(1,230),(2,220)],
+                       columnAttach=[(1,'left',0),(2,'left',0)])
+        self._rb_ainormal = cmds.radioButton(
+            label='aiNormalMap  (Arnold, recommended)',
+            collection=coll, select=True, height=24)
+        self._rb_bump2d   = cmds.radioButton(
+            label='bump2d  (Maya, other renderers)',
+            collection=coll, height=24)
+        cmds.setParent('..')
+
+        cmds.separator(height=14, style='in')
+
+        # Numeric
+        cmds.text(label='Numeric options', font='boldLabelFont',
+                  align='left', height=22)
+        cmds.separator(height=6, style='none')
+
+        cmds.rowLayout(numberOfColumns=2,
+                       columnWidth=[(1,240),(2,210)],
+                       columnAttach=[(1,'left',0),(2,'left',10)])
+        cmds.columnLayout(adjustableColumn=False, rowSpacing=4)
+        cmds.text(label='Height bump depth  (default 0.1)',
+                  font='smallPlainLabelFont', align='left', height=18)
+        self._fld_bump = cmds.floatField(
+            value=0.1, minValue=0.0, maxValue=10.0,
+            precision=3, step=0.01, width=120, height=24)
+        cmds.setParent('..')
+        cmds.columnLayout(adjustableColumn=False, rowSpacing=4)
+        cmds.text(label='Emission multiplier  (default 1.0)',
+                  font='smallPlainLabelFont', align='left', height=18)
+        self._fld_emission = cmds.floatField(
+            value=1.0, minValue=0.0, maxValue=100.0,
+            precision=2, step=0.1, width=120, height=24)
+        cmds.setParent('..')
+        cmds.setParent('..')
+
+        cmds.separator(height=14, style='in')
+
+        # Prefix
+        cmds.text(label='Texture set prefix  (optional)',
+                  font='boldLabelFont', align='left', height=22)
+        cmds.text(label='If Substance prefixed your texture sets (e.g. BUZZ_3_graaaays),',
+                  font='smallPlainLabelFont', align='left', height=18)
+        cmds.text(label='type that prefix here so the script can match material names correctly.',
+                  font='smallPlainLabelFont', align='left', height=18)
+        cmds.separator(height=6, style='none')
+        cmds.rowLayout(numberOfColumns=2,
+                       columnWidth=[(1,90),(2,340)],
+                       columnAttach=[(1,'left',0),(2,'left',8)])
+        cmds.text(label='Prefix:', font='smallPlainLabelFont',
+                  align='right', height=24, width=90)
+        self._fld_prefix = cmds.textField(
+            text='', placeholderText='e.g.   BUZZ_3_',
+            height=26, width=300)
+        cmds.setParent('..')
+
+        cmds.separator(height=14, style='in')
+
+        # Overwrite
+        cmds.text(label='Re-export workflow', font='boldLabelFont',
+                  align='left', height=22)
+        cmds.text(label='If you re-exported textures from Substance and want to refresh,',
+                  font='smallPlainLabelFont', align='left', height=18)
+        cmds.text(label='tick this box so the script re-connects existing shaders.',
+                  font='smallPlainLabelFont', align='left', height=18)
+        cmds.separator(height=6, style='none')
+        self._cb_overwrite = cmds.checkBox(
+            label='Re-connect existing shaders',
+            value=False, height=24)
+
+        cmds.separator(height=10, style='none')
+        cmds.setParent('..')  # inner columnLayout
+        cmds.setParent('..')  # frameLayout
+
+        cmds.separator(height=10, style='none')
+
+        cmds.showWindow(self.win)
+
+    def _browse(self, *_):
+        result = cmds.fileDialog2(fileMode=3, dialogStyle=2,
+                                  caption='Select Substance Painter Texture Folder')
+        if result:
+            self.folder = result[0]
+            cmds.textField(self._folder_field, edit=True, text=self.folder)
+
+    # ── Read options ──────────────────────────────────────────────
+
+    def _get_opts(self):
+        enabled = set()
+        if cmds.checkBox(self._cb_color,     query=True, value=True): enabled.add('color')
+        if cmds.checkBox(self._cb_metallic,  query=True, value=True): enabled.add('metallic')
+        if cmds.checkBox(self._cb_roughness, query=True, value=True): enabled.add('roughness')
+        if cmds.checkBox(self._cb_normal,    query=True, value=True): enabled.add('normal')
+        if cmds.checkBox(self._cb_height,    query=True, value=True): enabled.add('height')
+        if cmds.checkBox(self._cb_ao,        query=True, value=True): enabled.add('ao')
+        if cmds.checkBox(self._cb_emissive,  query=True, value=True): enabled.add('emissive')
+        if cmds.checkBox(self._cb_opacity,   query=True, value=True): enabled.add('opacity')
+        return {
+            'enabled_maps'  : enabled,
+            'normal_method' : 'aiNormalMap' if cmds.radioButton(
+                                  self._rb_ainormal, query=True, select=True) else 'bump2d',
+            'bump_depth'    : cmds.floatField(self._fld_bump,     query=True, value=True),
+            'emission_mult' : cmds.floatField(self._fld_emission, query=True, value=True),
+            'prefix'        : cmds.textField(self._fld_prefix,    query=True, text=True).strip(),
+            'overwrite'     : cmds.checkBox(self._cb_overwrite,   query=True, value=True),
+        }
+
+    # ── Apply ─────────────────────────────────────────────────────
+
+    def _apply(self, *_):
+        global _COLOR_CS, _RAW_CS
+        _COLOR_CS = None
+        _RAW_CS   = None
+
+        if not self.folder:
+            cmds.warning('Please select a texture folder first.')
+            return
+
+        sel = cmds.ls(selection=True, transforms=True)
+        if not sel:
+            cmds.warning('No objects selected.')
+            return
+
+        texture_map = build_texture_map(self.folder)
+        if not texture_map:
+            cmds.warning('No recognised texture files found in the selected folder.')
+            return
+
+        opts = self._get_opts()
+
+        print('\n╔═══════════════════════════════════════════════')
+        print('║  Substance -> Arnold Importer  v{}'.format(self.VERSION))
+        print('╠═══════════════════════════════════════════════')
+        print('║  Folder : {}'.format(self.folder))
+        print('║  Sets   : {}'.format(len(texture_map)))
+        print('║  Maps   : {}'.format(sorted(opts['enabled_maps'])))
+        print('║  Normal : {}'.format(opts['normal_method']))
+        if opts['prefix']:
+            print('║  Prefix : "{}"'.format(opts['prefix']))
+        if opts['overwrite']:
+            print('║  Mode   : reconnect existing shaders')
+        print('╚═══════════════════════════════════════════════')
+
+        done_sgs = {}
+        ok = skip = 0
+
+        for obj in sel:
+            short = obj.split('|')[-1]
+            pairs = get_materials_on_object(obj)
+
+            if not pairs:
+                print('\n[{}]  no material — skipping'.format(short))
+                skip += 1
+                continue
+
+            for (mat_name, sg) in pairs:
+                print('\n[{}]  material: {}  |  SG: {}'.format(short, mat_name, sg))
+
+                if sg in done_sgs:
+                    print('  -> SG already processed: {}'.format(done_sgs[sg]))
+                    ok += 1
+                    continue
+
+                ts = find_texture_set(mat_name, texture_map, prefix=opts['prefix'])
+                if not ts:
+                    print('  -> no match for "{}". Skipping.'.format(mat_name))
+                    skip += 1
+                    continue
+
+                print('  -> matched: {}'.format(ts))
+                maps = texture_map[ts]
+
+                shader_name = ts + '_mat'
+                existing    = cmds.ls(shader_name)
+                already     = existing and cmds.nodeType(existing[0]) == 'aiStandardSurface'
+
+                if already and not opts['overwrite']:
+                    shader = existing[0]
+                    print('  -> reusing shader: {}'.format(shader))
+                else:
+                    if already:
+                        shader = existing[0]
+                        print('  -> reconnecting shader: {}'.format(shader))
+                    else:
+                        shader = cmds.shadingNode('aiStandardSurface', asShader=True,
+                                                  name=shader_name)
+                        print('  -> created shader: {}'.format(shader))
+                    connect_maps(shader, maps, opts)
+
+                replace_shader_on_sg(sg, shader)
+                done_sgs[sg] = shader
+                print('  -> connected to SG: {}'.format(sg))
+                ok += 1
+
+        cmds.refresh()
+        print('\n══ Done: {} processed, {} skipped ══\n'.format(ok, skip))
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  ENTRY POINT
+# ═══════════════════════════════════════════════════════════════════
+
+def run():
+    SubstanceImporterUI().show()
+
+if __name__ == '__main__':
+    run()
